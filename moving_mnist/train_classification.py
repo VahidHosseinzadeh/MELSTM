@@ -1,0 +1,846 @@
+"""Train a motion-defined-digit classifier on Common-Fate Moving MNIST."""
+import argparse
+import json
+import math
+import warnings
+import os
+import random
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset, random_split
+
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+from common_fate_moving_mnist_dataset import CommonFateMovingMNISTDataset
+from torchvision.datasets import MNIST
+from motion_classification_model import build_classifier, recompute_bn_stats
+from mps_integer_warp import enable_integer_shift_warp
+
+
+def get_args(argv=None):
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+
+    p.add_argument('--model', choices=['lstm', 'felstm', 'melstm'], default='melstm')
+    p.add_argument('--hidden_size', type=int, default=32,
+                   help='Recurrent cell width. Carried on every velocity copy at every '
+                        'timestep and kept for BPTT, so felstm pays for this (2R+1)^2 times.')
+    p.add_argument('--kernel_size', type=int, default=3)
+    p.add_argument('--v_range', type=int, default=2,
+                   help='felstm only: velocity lattice half-width, giving (2R+1)^2 copies. '
+                        'Must be >= --data_v_range or no copy can represent the figure.')
+    p.add_argument('--num_vel_modes', type=int, default=2,
+                   help='melstm only: number of velocity slots. The scene contains exactly '
+                        'TWO motions -- the digit and the background -- so 2 is the right '
+                        'number, and measured slot_hit_fig confirms it: with '
+                        '--velocity_source bootstrap it is 97.9%% at K=2 and identically '
+                        '97.9%% at K=3 and K=4, so extra slots buy nothing and cost compute '
+                        'linearly. (With the weaker frame_pair source, K=2 only reaches '
+                        '69%% and extra slots DO help -- which is a defect of the peak '
+                        'selection, not evidence that the scene has more motions.)')
+    p.add_argument('--velocity_source', choices=['bootstrap', 'frame_pair', 'tracked'],
+                   default='bootstrap',
+                   help="melstm only: where slot velocities come from. Measured "
+                        "slot_hit_fig at K=2 on this data: bootstrap 97.9%%, frame_pair "
+                        "68.8%%, tracked 0.0%%. "
+                        "'tracked' is MEConvLSTM's own protocol (correlate each slot's "
+                        "hidden state against the next frame); it needs a clean template "
+                        "and has none here, so no slot ends up on either motion and the "
+                        "slots collapse onto each other. "
+                        "'frame_pair' takes the top-K peaks of the raw frame pair, but the "
+                        "background dominates the correlation surface so the figure's peak "
+                        "often loses to the noise floor. "
+                        "'bootstrap' (default) explains the dominant motion away first and "
+                        "re-correlates the residual, which is what makes the MINORITY "
+                        "motion reliably findable -- and therefore what makes K=2 correct.")
+    p.add_argument('--velocity_pool', choices=['attention', 'max', 'mean', 'concat'],
+                   default='attention',
+                   help="How the velocity axis is reduced before the head. 'max' is the "
+                        "default elsewhere in this repo and is expected to do BADLY here: "
+                        "every copy carries equal-amplitude noise, so the informative one "
+                        "is distinguished by spatial COHERENCE, not by magnitude.")
+    p.add_argument('--pool_temperature', type=float, default=1.0)
+    p.add_argument('--head_channels', type=int, default=64)
+    p.add_argument('--head_blocks', type=int, default=3)
+    p.add_argument('--head_mlp_hidden', type=int, default=128)
+    p.add_argument('--head_dropout', type=float, default=0.0)
+    p.add_argument('--head_mlp_act', choices=['relu', 'leaky'], default='relu',
+                   help="Activation of the head MLP's hidden layer. With 'relu' all of "
+                        "its units can die (every chance-level run so far: constant "
+                        "logits, train loss flat at 2.3011, no gradient to the backbone); "
+                        "'leaky' (LeakyReLU 0.01) cannot. Same initial weights either way.")
+    p.add_argument('--precise_bn_batches', type=int, default=50,
+                   help="Batches used to RE-ESTIMATE BatchNorm statistics before each "
+                        "evaluation (0 = off, use the running EMA). BatchNorm's EMA is "
+                        "collected while the weights are still moving, and for a head on a "
+                        "recurrent state it never catches up -- val accuracy then bounces "
+                        "between chance and its true value while training accuracy rises "
+                        "smoothly. Recomputing gives the exact statistics for the CURRENT "
+                        "weights. No effect when --head_norm is not 'batch'.")
+    p.add_argument('--head_norm', choices=['batch', 'group', 'none'], default='batch',
+                   help="Normalisation in the classifier head. 'batch' (default) is the "
+                        "only one that LEARNS on this task -- measured over 14 epochs, "
+                        "batch reaches 0.230 train accuracy while group (at 1e-3 and 3e-3) "
+                        "and none all stay flat at ~0.11. Batch statistics remove the "
+                        "component common to every sample, which here is the background "
+                        "noise that dominates the figure's contribution. Its running "
+                        "statistics do lag badly on this model, which is what "
+                        "--precise_bn_batches exists to fix.")
+
+    p.add_argument('--root', type=str, default=str(_HERE.parent / 'data'))
+    p.add_argument('--seq_len', type=int, default=15, help='Context frames T')
+    p.add_argument('--image_size', type=int, default=36,
+                   help='Canvas size. 36 keeps a 28px digit on a torus with room to move '
+                        'while staying affordable for felstm, whose cost carries every one '
+                        'of its (2R+1)^2 copies at every timestep.')
+    p.add_argument('--num_figures', type=int, default=1)
+    p.add_argument('--variant', choices=['moving_mask', 'static_mask'], default='moving_mask')
+    p.add_argument('--corr_len', type=float, default=0.0,
+                   help='Texture correlation length. LEAVE AT 0. Above 0, pixels within a '
+                        'region are correlated while pixels across the figure boundary are '
+                        'not, so the outline is a local-statistics discontinuity present in '
+                        'EVERY frame. A single-frame CNN with no temporal information at '
+                        'all scores 11%% / 13%% / 24%% / 36%% at corr_len 0 / 0.5 / 1 / 2 '
+                        '(chance 10%%) -- so at the old 1.0 default a per-frame model could '
+                        'already do most of the job, and lstm reaching high accuracy meant '
+                        'the dataset was leaking, not that it had learned motion.')
+    p.add_argument('--data_v_range', type=int, default=2, help="Figure max speed")
+    p.add_argument('--bg_mode', choices=['opposite', 'disjoint'], default='opposite',
+                   help="How the background is kept distinguishable from the figure. "
+                        "'opposite' (default) keeps it on the SHARED velocity grid and "
+                        "requires it to travel in an opposing direction at t=0. 'disjoint' "
+                        "gives it a faster grid of its own (--bg_speed_min/max), which "
+                        "guarantees they never coincide but puts the background BEYOND "
+                        "every lattice copy felstm has -- a motion felstm structurally "
+                        "cannot represent while melstm's tracked slots can, which confounds "
+                        "expressive power with the effect being measured. Use 'disjoint' "
+                        "only when felstm is not in the comparison.")
+    p.add_argument('--bg_speed_min', type=int, default=4,
+                   help='--bg_mode disjoint only: background min speed, must exceed '
+                        '--data_v_range.')
+    p.add_argument('--bg_speed_max', type=int, default=5,
+                   help='--bg_mode disjoint only.')
+    p.add_argument('--motion_mode', choices=['constant', 'piecewise', 'stochastic', 'accelerate'],
+                   default='piecewise')
+    p.add_argument('--transition_mode', choices=['uniform', 'smooth'], default='smooth')
+    p.add_argument('--min_segment', type=int, default=3)
+    p.add_argument('--max_segment', type=int, default=6)
+    p.add_argument('--digit_scale', type=int, default=1)
+    p.add_argument('--normalize', choices=['affine', 'minmax', 'none'], default='affine')
+
+    p.add_argument('--batch_size', type=int, default=64)
+    p.add_argument('--epochs', type=int, default=40)
+    p.add_argument('--lr', type=float, default=1e-3)
+    p.add_argument('--weight_decay', type=float, default=0.0)
+    p.add_argument('--grad_clip', type=float, default=1.0)
+    p.add_argument('--num_workers', type=int, default=4)
+    p.add_argument('--distinct_worker_streams', action='store_true',
+                   help='Give every DataLoader worker its own reproducible RNG stream (fixed val/test sets '
+                        'otherwise share textures, positions and motions across workers). Off by default '
+                        'because it changes the benchmark sets. See worker_seeding.py.')
+    p.add_argument('--max_train_samples', type=int, default=None,
+                   help='Cap on training glyphs per epoch (None = all of them, 54000 at '
+                        'the default --val_fraction). Each glyph is re-rendered with fresh '
+                        'velocities and textures on every access, so lowering this reduces '
+                        'the number of DISTINCT DIGITS seen, not just the epoch length.')
+    p.add_argument('--val_fraction', type=float, default=0.1)
+    p.add_argument('--val_size', type=int, default=None,
+                   help='Cap on validation glyphs per epoch (None = all 6000). The val '
+                        'set is fixed, so this trades statistical precision for epoch time.')
+    p.add_argument('--test_size', type=int, default=None,
+                   help='Cap on test glyphs (None = all 10000, MNIST\'s entire test '
+                        'split). With --val_fraction 0.1 the three pools are then '
+                        '54000/6000/10000, i.e. MNIST\'s own split, re-rendered under '
+                        'motion. Only the reported test number is affected; lowering '
+                        'this trades statistical precision for time.')
+    p.add_argument('--test_every', type=int, default=1,
+                   help='Also evaluate the TEST set every N epochs, so wandb gets a '
+                        'test_acc/test_loss curve rather than one final point (0 = off). '
+                        'Model selection still reads val only -- the checkpoint, the '
+                        'scheduler and early stopping never see this number, and the '
+                        'reported test_acc is still the best-val checkpoint measured '
+                        'once at the end. Treat the curve as a diagnostic: a human '
+                        'watching it and stopping a run on it is selecting on test.')
+    p.add_argument('--test_curve_size', type=int, default=2000,
+                   help='How many test sequences each per-epoch curve point uses '
+                        '(0 = all of them). The FINAL number always uses the full '
+                        '--test_size; this only caps the diagnostic curve, which at '
+                        '10000 sequences would otherwise add ~19%% to every epoch for '
+                        'a standard error already below 0.2%%. The subset is the '
+                        'loader\'s first N sequences, so it is the same set every '
+                        'epoch rather than a fresh sample.')
+    p.add_argument('--early_stop_patience', type=int, default=0,
+                   help='Stop once the selection metric (val accuracy) has not improved for '
+                        'this many consecutive epochs. 0 = DISABLED, always run the full '
+                        '--epochs, which is the default.')
+    p.add_argument('--val_curve_interval', type=int, default=25,
+                   help='Record validation loss every N training batches, for a '
+                        'loss-vs-steps curve far finer than one point per epoch (0 = off).')
+    p.add_argument('--val_curve_size', type=int, default=256,
+                   help='Number of FIXED validation sequences behind that curve. They are '
+                        'materialised into a tensor once: this dataset resamples content on '
+                        'every access, so holding indices fixed is not enough to keep the '
+                        'measured set fixed.')
+    p.add_argument('--val_curve_bn_batches', type=int, default=8,
+                   help='Batches used to re-estimate BatchNorm before each point of that '
+                        'curve (0 = off, use the running EMA). Without this the curve is '
+                        'measured under a different BatchNorm regime than the per-epoch '
+                        'val_acc and swings between chance and the true accuracy while the '
+                        'model improves smoothly -- see --precise_bn_batches. Smaller than '
+                        'that default because it runs every --val_curve_interval steps: 8 '
+                        'batches is already ~500 sequences of statistics per channel.')
+    p.add_argument('--use_lr_scheduler', action='store_true')
+    p.add_argument('--lr_schedule', choices=['plateau', 'cosine'], default='plateau',
+                   help="plateau = ReduceLROnPlateau on val accuracy when --use_lr_scheduler "
+                        "(the original). cosine = linear warmup over --warmup_epochs, then "
+                        "cosine decay to --final_lr, per batch and fixed in advance; it "
+                        "ignores --use_lr_scheduler. A fixed schedule cannot cut the LR while "
+                        "a run is still at chance (the plateau scheduler's first cut came at "
+                        "epochs 6-12 in every run that never left chance).")
+    p.add_argument('--warmup_epochs', type=float, default=1.0, help='--lr_schedule cosine only')
+    p.add_argument('--final_lr', type=float, default=1e-5, help='--lr_schedule cosine only')
+    p.add_argument('--x_curriculum_epochs', type=int, default=0,
+                   help="melstm with --velocity_source tracked: the stochastic handover of the "
+                        "x-tracking curriculum. In training, every step t >= 2 of every sequence "
+                        "takes the frame-pair velocity with probability p(epoch) and its own "
+                        "h-tracked one otherwise; p falls from 1 at the first epoch to 0 at this "
+                        "many epochs in (--x_curriculum_shape), and evaluation is always "
+                        "h-tracking. 0 = off")
+    p.add_argument('--x_curriculum_shape', choices=['linear', 'cosine'], default='cosine',
+                   help='how p falls from 1 to 0 over --x_curriculum_epochs')
+    p.add_argument('--lr_patience', type=int, default=4)
+    p.add_argument('--lr_factor', type=float, default=0.5)
+
+    p.add_argument('--data_seed', type=int, default=42,
+                   help='Governs the DATA and should be held FIXED across a seed sweep: '
+                        'the 54000/6000 train/val glyph split, the seeded val and test '
+                        'benchmarks, and which sequences the state images use. Changing it '
+                        'changes the benchmark itself, so runs with different data_seeds '
+                        'are not comparable to each other.')
+    p.add_argument('--model_seed', type=int, default=None,
+                   help='Governs the RUN and is what to vary across a seed sweep: weight '
+                        'initialisation and the order training data is visited. None = '
+                        'follow --data_seed. Vary this alone and every run is scored on '
+                        'the identical val set, so the spread you measure is run-to-run '
+                        'variance rather than a different benchmark each time.')
+    p.add_argument('--run_name', type=str, default=None)
+    p.add_argument('--save_dir', type=str, default='./experiments_classification/')
+    p.add_argument('--resume', type=str, default=None)
+    p.add_argument('--use_wandb', action='store_true')
+    p.add_argument('--log_states_every', type=int, default=1,
+                   help='Log the per-velocity-copy hidden state to wandb every N epochs '
+                        '(0 = off; 1 = every epoch, the default, since the whole point is '
+                        'watching it develop). Uses a FIXED set of sequences so the slider '
+                        'shows the same sample developing as training proceeds. This is '
+                        'the picture the experiment rests on: the frame row is noise, and '
+                        'the question is whether the copy transported at the figure '
+                        'velocity grows the digit while the others do not.')
+    p.add_argument('--log_states_samples', type=int, default=30,
+                   help='How many sequences to DRAW each time states are logged. Chosen at '
+                        'random from the fixed benchmark set, then held fixed, so the '
+                        'pictures span different digits and speeds while still showing the '
+                        'SAME sequences developing across epochs.')
+    p.add_argument('--log_states_readout_samples', type=int, default=3,
+                   help='Additional DIAGNOSTIC panels, logged under val_readout_states_*, '
+                        'that add a local-variance row under the figure copy -- the picture '
+                        'form of val_state_shape_iou. Kept separate from the paper panels '
+                        'because it is a diagnostic about the metric, not about the model. '
+                        '0 = off.')
+    p.add_argument('--states_fig_dir', type=str, default=None,
+                   help='Write the state panels here as PNG and PDF, for the paper. Only '
+                        'the FINAL epoch is written, however often --log_states_every logs '
+                        'to wandb: the slider there is for watching training, the files are '
+                        'for the paper and want one trained model, not fifty.')
+    p.add_argument('--state_metric_samples', type=int, default=64,
+                   help='How many sequences val_state_shape_iou averages over. Independent '
+                        'of --log_states_samples: the scalar wants many for a readable '
+                        'curve, the pictures want few to stay legible.')
+    p.add_argument('--wandb_project', type=str, default='FERNN-common-fate')
+    p.add_argument('--wandb_entity', type=str, default=None)
+    p.add_argument('--wandb_dir', type=str, default='./tmp/')
+    p.add_argument('--device', type=str, default=None)
+    p.add_argument('--smoke_test', action='store_true',
+                   help='Tiny run: a few batches per epoch, 2 epochs, no wandb. '
+                        'For checking the plumbing end to end.')
+    return p.parse_args(argv)
+
+
+def build_datasets(args):
+    want_mask = bool(args.use_wandb and args.log_states_every)
+    common = dict(
+        root=args.root, image_size=args.image_size, seq_len=args.seq_len,
+        num_figures=args.num_figures, variant=args.variant, corr_len=args.corr_len,
+        digit_scale=args.digit_scale, normalize=args.normalize,
+        max_speed=args.data_v_range,
+        bg_opposite_at_start=(args.bg_mode == "opposite"),
+        bg_speed_range=((args.bg_speed_min, args.bg_speed_max)
+                        if args.bg_mode == "disjoint" else None),
+        motion_mode=args.motion_mode, transition_mode=args.transition_mode,
+        min_segment=args.min_segment, max_segment=args.max_segment,
+        return_motion=True, return_mask=want_mask, download=True,
+    )
+    # split MNIST train glyphs (not indices) into disjoint train / val pools
+    n_mnist = len(MNIST(root=args.root, train=True, download=True))
+    perm = torch.randperm(n_mnist, generator=torch.Generator().manual_seed(args.data_seed))
+    n_val = int(round(args.val_fraction * n_mnist))
+    val_idx = perm[:n_val].tolist()
+    train_idx = perm[n_val:].tolist()
+
+    train = CommonFateMovingMNISTDataset(train=True, random=True, seed=args.data_seed,
+                                         digit_indices=train_idx, **common)
+    # val and test are fixed benchmarks: reset_rng() before every pass, no persistent workers
+    val = CommonFateMovingMNISTDataset(train=True, random=False, seed=777,
+                                       digit_indices=val_idx, **common)
+    test = CommonFateMovingMNISTDataset(train=False, random=False, seed=123, **common)
+    return train, val, test
+
+
+def make_loaders(args, train_ds, val_ds, test_ds):
+    tr, va = train_ds, val_ds
+    if args.max_train_samples and args.max_train_samples < len(tr):
+        tr = Subset(tr, list(range(args.max_train_samples)))
+    if args.val_size and args.val_size < len(va):
+        va = Subset(va, list(range(args.val_size)))
+    if args.smoke_test:
+        tr = Subset(tr, list(range(2 * args.batch_size)))
+        va = Subset(va, list(range(args.batch_size)))
+
+    te = test_ds
+    if args.test_size and args.test_size < len(te):
+        te = Subset(te, list(range(args.test_size)))
+    if args.smoke_test:
+        te = Subset(test_ds, list(range(args.batch_size)))
+
+    n_state = min(max(args.log_states_samples, args.state_metric_samples), len(test_ds))
+    state_idx = torch.randperm(
+        len(test_ds), generator=torch.Generator().manual_seed(args.data_seed + 1)
+    )[:n_state].tolist()
+    st = Subset(test_ds, state_idx)
+
+    kw = dict(num_workers=args.num_workers, pin_memory=torch.cuda.is_available())
+    if getattr(args, 'distinct_worker_streams', False) and args.num_workers > 0:
+        from worker_seeding import worker_init_fn
+        kw['worker_init_fn'] = worker_init_fn
+    return (DataLoader(tr, batch_size=args.batch_size, shuffle=True,
+                       persistent_workers=args.num_workers > 0, **kw),
+            DataLoader(va, batch_size=args.batch_size, persistent_workers=False, **kw),
+            DataLoader(te, batch_size=args.batch_size, persistent_workers=False, **kw),
+            DataLoader(st, batch_size=n_state, shuffle=False, num_workers=0))
+
+
+def velocity_diagnostics(aux, motion, n_figures):
+    out = {}
+    v = aux.get("velocities")
+    if v is None or motion is None:
+        return out
+
+    v_last = v[:, -1]
+    gt_fig = motion[:, -2, 0]
+    gt_bg = motion[:, -2, n_figures]
+
+    hit_fig = (v_last.round().long() == gt_fig[:, None, :]).all(-1)
+    hit_bg = (v_last.round().long() == gt_bg[:, None, :]).all(-1)
+    out["slot_hit_fig"] = hit_fig.any(-1).float().mean().item()
+    out["slot_hit_bg"] = hit_bg.any(-1).float().mean().item()
+
+    w = aux.get("pool_weights")
+    if w is not None and w.shape[1] == v_last.shape[1]:
+        out["attn_on_fig"] = (w * hit_fig.float()).sum(-1).mean().item()
+        out["attn_on_bg"] = (w * hit_bg.float()).sum(-1).mean().item()
+        out["attn_entropy"] = (-(w.clamp_min(1e-9).log() * w).sum(-1)).mean().item()
+        out["attn_entropy_max"] = float(np.log(w.shape[1]))
+    return out
+
+
+def _local_var(x, k=3):
+    x = x.unsqueeze(1)
+    pad = k // 2
+    mu = F.avg_pool2d(F.pad(x, (pad,) * 4, mode="circular"), k, stride=1)
+    mu2 = F.avg_pool2d(F.pad(x * x, (pad,) * 4, mode="circular"), k, stride=1)
+    return (mu2 - mu * mu).clamp(min=0).squeeze(1)
+
+
+def _area_matched_iou(score, mask):
+    B = score.shape[0]
+    s = score.reshape(B, -1)
+    t = mask.reshape(B, -1) > 0.5
+    k = t.sum(1).clamp(min=1)
+    thr = s.sort(dim=1, descending=True).values.gather(1, (k - 1).unsqueeze(1))
+    p = s >= thr
+    return ((p & t).sum(1).float() / (p | t).sum(1).clamp(min=1).float())
+
+
+def state_shape_iou(model, states, velocities, motion, mask):
+    if mask is None or motion is None or states is None:
+        return None
+
+    h = states[:, -1]
+    B, V = h.shape[:2]
+    gt_fig = motion[:, -2, 0]
+    target = mask[:, -1].amax(dim=1)
+
+    idx = torch.zeros(B, dtype=torch.long, device=h.device)
+    valid = torch.ones(B, dtype=torch.bool, device=h.device)
+
+    if model.model in ("lstm", "felstm"):
+        grid = {tuple(v): k for k, v in enumerate(model.backbone.cell.v_list)}
+        for b in range(B):
+            key = tuple(int(x) for x in gt_fig[b])
+            if key in grid:
+                idx[b] = grid[key]
+            elif V == 1:
+                idx[b] = 0
+            else:
+                valid[b] = False
+    else:
+        if velocities is None:
+            return None
+        match = (velocities[:, -1].round().long() == gt_fig[:, None, :]).all(-1)
+        idx = match.float().argmax(-1)
+        valid = match.any(-1)
+
+    if not bool(valid.any()):
+        return None
+    sel = h[torch.arange(B, device=h.device), idx]
+    matched = _area_matched_iou(_local_var(sel), target)
+    best = torch.stack([_area_matched_iou(_local_var(h[:, v]), target)
+                        for v in range(V)]).max(dim=0).values
+    return float(matched[valid].mean()), float(best.mean())
+
+
+def log_states(model, loader, fixed_ds, device, args, epoch, step, save=False):
+    from visualization import log_motion_classification_states
+
+    fixed_ds.reset_rng()
+    batch = next(iter(loader))
+    n = min(args.state_metric_samples, batch[0].shape[0])
+    seq = batch[0][:n].to(device)
+    motion = batch[2][:n].to(device) if len(batch) > 2 else None
+    mask = batch[3][:n].to(device) if len(batch) > 3 else None
+
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        h_last, velocities, states = model.encode(seq, return_states=True)
+    model.train(was_training)
+
+    extra = {}
+    iou = state_shape_iou(model, states, velocities, motion, mask)
+    if iou is not None:
+        extra["val_state_shape_iou"] = iou[0]
+        extra["val_state_shape_iou_best"] = iou[1]
+        if mask is not None:
+            extra["val_state_shape_iou_chance"] = float(mask[:, -1].amax(1).mean())
+
+    v_list = (model.backbone.cell.v_list
+              if model.model in ("lstm", "felstm") else None)
+    log_motion_classification_states(
+        states, seq, mask_track=mask, velocities=velocities,
+        v_list=v_list, gt_motion=motion, split_name="val", epoch=epoch,
+        step=step, num_samples=min(args.log_states_samples, seq.shape[0]),
+        save_dir=args.states_fig_dir if save else None)
+
+    if args.log_states_readout_samples:
+        log_motion_classification_states(
+            states, seq, mask_track=mask, velocities=velocities,
+            v_list=v_list, gt_motion=motion, split_name="val_readout", epoch=epoch,
+            step=step,
+            num_samples=min(args.log_states_readout_samples, seq.shape[0]),
+            show_shape_readout=True)
+    return extra
+
+
+class ValCurveRecorder:
+    def __init__(self, dataset, n_sequences, interval, device, batch_size=64,
+                 bn_dataset=None, bn_batches=0):
+        n = min(n_sequences, len(dataset))
+        if hasattr(dataset, "reset_rng"):
+            dataset.reset_rng()
+        seqs, labels = [], []
+        for i in range(n):
+            item = dataset[i]
+            seqs.append(item[0])
+            labels.append(item[1])
+        self.seq = torch.stack(seqs)
+        self.label = torch.tensor(labels, dtype=torch.long)
+        self.interval = interval
+        self.device = device
+        self.batch_size = batch_size
+        # materialised: iterating the live train_loader here would restart its epoch
+        self._bn = []
+        if bn_batches > 0 and bn_dataset is not None:
+            want = min(bn_batches * batch_size, len(bn_dataset))
+            pick = torch.randperm(
+                len(bn_dataset), generator=torch.Generator().manual_seed(0)
+            )[:want].tolist()
+            xs = torch.stack([bn_dataset[i][0] for i in pick])
+            self._bn = [(xs[i:i + batch_size],)
+                        for i in range(0, len(xs), batch_size)]
+        self.steps, self.val_loss, self.val_acc, self.train_loss = [], [], [], []
+
+    def maybe_record(self, model, step, train_loss, criterion, log_fn=None):
+        if self.interval <= 0 or step % self.interval:
+            return
+        was_training = model.training
+        saved_bn = None
+        if self._bn:
+            bns = [m for m in model.modules()
+                   if isinstance(m, nn.modules.batchnorm._BatchNorm)]
+            if bns:
+                saved_bn = [(bn, {k: v.clone() for k, v in bn.state_dict().items()})
+                            for bn in bns]
+                recompute_bn_stats(model, self._bn, self.device, len(self._bn))
+        model.eval()
+        tot_loss = correct = n = 0
+        with torch.no_grad():
+            for i in range(0, len(self.seq), self.batch_size):
+                x = self.seq[i:i + self.batch_size].to(self.device)
+                y = self.label[i:i + self.batch_size].to(self.device)
+                logits = model(x)
+                tot_loss += criterion(logits, y).item() * y.numel()
+                correct += (logits.argmax(1) == y).sum().item()
+                n += y.numel()
+        if saved_bn is not None:
+            for bn, state in saved_bn:
+                bn.load_state_dict(state)
+        model.train(was_training)
+        vl, vacc = tot_loss / max(n, 1), correct / max(n, 1)
+        self.steps.append(step)
+        self.val_loss.append(vl)
+        self.val_acc.append(vacc)
+        self.train_loss.append(train_loss)
+        if log_fn is not None:
+            log_fn(step, {"curve/val_loss": vl, "curve/val_acc": vacc,
+                          "curve/train_loss": train_loss})
+
+    def as_dict(self):
+        return {"step": self.steps, "val_loss": self.val_loss,
+                "val_acc": self.val_acc, "train_loss": self.train_loss}
+
+
+def run_epoch(model, loader, device, n_figures, criterion, optimizer=None,
+              grad_clip=1.0, max_batches=None, collect_preds=False,
+              curve=None, global_step=0, curve_log_fn=None, lr_fn=None):
+    train = optimizer is not None
+    model.train(train)
+    tot_loss = tot_correct = tot_n = 0
+    diag_sum, diag_n = {}, 0
+    y_true, y_pred = [], []
+
+    for b, batch in enumerate(loader):
+        if max_batches and b >= max_batches:
+            break
+        seq, label = batch[0].to(device), batch[1].to(device)
+        motion = batch[2].to(device) if len(batch) > 2 else None
+
+        with torch.set_grad_enabled(train):
+            logits, aux = model(seq, return_aux=True)
+            loss = criterion(logits, label)
+
+        if train:
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            if grad_clip:
+                torch.nn.utils.clip_grad_norm_(model.trainable_parameters(), grad_clip)
+            if lr_fn is not None:
+                for g in optimizer.param_groups:
+                    g["lr"] = lr_fn(global_step)
+            optimizer.step()
+            global_step += 1
+            if curve is not None:
+                curve.maybe_record(model, global_step, loss.item(), criterion,
+                                   log_fn=curve_log_fn)
+
+        bs = label.size(0)
+        pred = logits.argmax(1)
+        tot_loss += loss.item() * bs
+        tot_correct += (pred == label).sum().item()
+        tot_n += bs
+        if collect_preds:
+            y_true.extend(label.tolist())
+            y_pred.extend(pred.tolist())
+
+        with torch.no_grad():
+            d = velocity_diagnostics(aux, motion, n_figures)
+        if d:
+            for k, val in d.items():
+                diag_sum[k] = diag_sum.get(k, 0.0) + val
+            diag_n += 1
+
+    stats = {"loss": tot_loss / max(tot_n, 1), "acc": tot_correct / max(tot_n, 1)}
+    if diag_n:
+        stats.update({k: v / diag_n for k, v in diag_sum.items()})
+    if collect_preds:
+        stats["_y_true"], stats["_y_pred"] = y_true, y_pred
+    stats["_global_step"] = global_step
+    return stats
+
+
+def main(argv=None):
+    args = get_args(argv)
+    if args.x_curriculum_epochs:
+        assert args.model == "melstm" and args.velocity_source == "tracked", \
+            "--x_curriculum_epochs needs --model melstm --velocity_source tracked"
+        assert args.x_curriculum_epochs >= 2, "--x_curriculum_epochs must be >= 2"
+
+    if args.smoke_test:
+        args.epochs, args.num_workers, args.use_wandb = 2, 0, False
+        args.max_train_samples = 2 * args.batch_size
+
+    if args.bg_mode == "disjoint" and args.bg_speed_min <= args.data_v_range:
+        raise SystemExit(
+            f"--bg_speed_min ({args.bg_speed_min}) must exceed --data_v_range "
+            f"({args.data_v_range}); that is what makes the background grid disjoint "
+            f"from the figure grid so the two can never coincide.")
+    if args.bg_mode == "disjoint" and args.model == "felstm":
+        warnings.warn(
+            "--bg_mode disjoint puts the background outside felstm's velocity lattice, "
+            "so felstm cannot represent the background motion at all while melstm can. "
+            "That is a difference in expressive power confounded with the effect being "
+            "measured. Prefer --bg_mode opposite for a three-way comparison.",
+            UserWarning)
+    if args.model == "felstm" and args.v_range < args.data_v_range:
+        raise SystemExit(
+            f"--v_range ({args.v_range}) < --data_v_range ({args.data_v_range}): "
+            f"felstm's copies sit at fixed lattice velocities, so no copy could "
+            f"represent a figure moving faster than {args.v_range}. Raise --v_range "
+            f"(cost grows as (2R+1)^2) or lower --data_v_range.")
+
+    torch.manual_seed(args.data_seed)
+    np.random.seed(args.data_seed)
+    random.seed(args.data_seed)
+    if args.model_seed is not None:
+        torch.manual_seed(args.model_seed)
+
+    device = torch.device(args.device) if args.device else torch.device(
+        "cuda" if torch.cuda.is_available() else
+        ("mps" if torch.backends.mps.is_available() else "cpu"))
+
+    # MPS cannot backprop grid_sample: use the exact integer-shift warp
+    if device.type == "mps" and args.model == "melstm":
+        res = enable_integer_shift_warp(device="mps")
+        if res is not None:
+            print(f"warp         : integer-shift gather enabled for MPS "
+                  f"(exact vs torch.roll: {res[0]:.0e}, grid_sample differs by {res[1]:.1e})")
+
+    run_name = args.run_name or f"cf_cls_{args.model}_{args.velocity_pool}_{int(time.time())}"
+    models_dir = Path(args.save_dir) / "models"
+    results_dir = Path(args.save_dir) / "results"
+    state_dir = Path(args.save_dir) / "run_state"
+    for d in (models_dir, results_dir, state_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    train_ds, val_ds, test_ds = build_datasets(args)
+    train_loader, val_loader, test_loader, state_loader = make_loaders(
+        args, train_ds, val_ds, test_ds)
+
+    model = build_classifier(args).to(device)
+    report = model.parameter_report()
+    print(f"run          : {run_name}")
+    print(f"device       : {device}")
+    print(f"pool         : {args.velocity_pool}")
+    print(model.describe())
+    print()
+    bg_desc = ("on the shared grid, opposing direction at t=0"
+               if args.bg_mode == "opposite"
+               else f"|v| in [{args.bg_speed_min}, {args.bg_speed_max}] (disjoint grid)")
+    print(f"data         : figure |v|<={args.data_v_range} ({args.motion_mode}), "
+          f"background {bg_desc}, corr_len={args.corr_len}, T={args.seq_len}")
+    test_curve_batches = (math.ceil(args.test_curve_size / args.batch_size)
+                          if args.test_curve_size else None)
+    print(f"batches      : train {len(train_loader)}, val {len(val_loader)}, "
+          f"test {len(test_loader)}  (chance accuracy = 10%)")
+    print(f"glyphs       : train {len(train_loader.dataset)}, "
+          f"val {len(val_loader.dataset)}, test {len(test_loader.dataset)} "
+          f"(disjoint pools; test is MNIST's own split)")
+
+    optimizer = torch.optim.Adam(model.trainable_parameters(), lr=args.lr,
+                                 weight_decay=args.weight_decay)
+    scheduler = (torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=args.lr_factor, patience=args.lr_patience)
+        if args.use_lr_scheduler and args.lr_schedule == "plateau" else None)
+    lr_fn = None
+    if args.lr_schedule == "cosine":
+        total = args.epochs * len(train_loader)
+        warm = max(1, int(round(args.warmup_epochs * len(train_loader))))
+
+        def lr_fn(step):
+            if step < warm:
+                return args.lr * (step + 1) / warm
+            q = min(1.0, (step - warm) / max(1, total - warm))
+            return args.final_lr + 0.5 * (args.lr - args.final_lr) * (1 + math.cos(math.pi * q))
+        print(f"LR schedule  : warmup {warm} steps to {args.lr:g}, cosine to "
+              f"{args.final_lr:g} at step {total} (plateau scheduler off)")
+
+    def x_track_p_at(epoch):
+        E = args.x_curriculum_epochs
+        if E <= 0 or epoch >= E - 1:
+            return 0.0
+        frac = epoch / (E - 1)
+        if args.x_curriculum_shape == "linear":
+            return 1.0 - frac
+        return 0.5 * (1.0 + math.cos(math.pi * frac))
+    criterion = nn.CrossEntropyLoss()
+
+    wandb = None
+    if args.use_wandb:
+        import wandb as _wandb
+        wandb = _wandb
+        wandb.init(project=args.wandb_project, entity=args.wandb_entity,
+                   dir=args.wandb_dir, name=run_name, config=vars(args) | report)
+
+    history = {"config": vars(args), "parameters": report, "epochs": []}
+    best_val, best_epoch, since_improved = -1.0, -1, 0
+    start_epoch, global_step = 0, 0
+
+    curve_log_fn = None
+    if wandb:
+        wandb.define_metric("epoch")
+        curve_log_fn = lambda step, payload: wandb.log(payload, step=step)
+
+    curve = None
+    if args.val_curve_interval > 0:
+        print(f"materialising {args.val_curve_size} fixed val sequences for the loss curve...")
+        curve = ValCurveRecorder(val_ds, args.val_curve_size,
+                                 args.val_curve_interval, device, args.batch_size,
+                                 bn_dataset=train_loader.dataset,
+                                 bn_batches=args.val_curve_bn_batches)
+
+    if args.resume and Path(args.resume).exists():
+        ck = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ck["model"])
+        optimizer.load_state_dict(ck["optimizer"])
+        start_epoch = ck["epoch"] + 1
+        best_val, history = ck["best_val"], ck["history"]
+        global_step = ck.get("global_step", 0)
+        print(f"resumed from {args.resume} at epoch {start_epoch}")
+
+    for epoch in range(start_epoch, args.epochs):
+        t0 = time.time()
+        if args.x_curriculum_epochs:
+            model.x_track_p = x_track_p_at(epoch)
+            print(f"  stochastic handover: P(frame-pair velocity) = {model.x_track_p:.3f}")
+        tr = run_epoch(model, train_loader, device, args.num_figures, criterion,
+                       optimizer, args.grad_clip, curve=curve, global_step=global_step,
+                       curve_log_fn=curve_log_fn, lr_fn=lr_fn)
+        # BatchNorm statistics lag the weights: re-estimate them before every evaluation
+        recompute_bn_stats(model, train_loader, device, args.precise_bn_batches)
+        val_ds.reset_rng()
+        va = run_epoch(model, val_loader, device, args.num_figures, criterion)
+
+        if scheduler:
+            scheduler.step(va["acc"])
+
+        te_row = {}
+        if args.test_every and epoch % args.test_every == 0:
+            test_ds.reset_rng()
+            te_epoch = run_epoch(model, test_loader, device, args.num_figures, criterion,
+                                 max_batches=test_curve_batches)
+            te_epoch.pop("_global_step", None)
+            te_row = {f"test_{k}": v for k, v in te_epoch.items()}
+
+        global_step = tr.pop("_global_step", global_step)
+        va.pop("_global_step", None)
+        row = {"epoch": epoch, "time": time.time() - t0,
+               "lr": optimizer.param_groups[0]["lr"],
+               **({"x_track_p": model.x_track_p} if args.x_curriculum_epochs else {}),
+               **{f"train_{k}": v for k, v in tr.items()},
+               **{f"val_{k}": v for k, v in va.items()},
+               **te_row}
+
+        if wandb and args.log_states_every and epoch % args.log_states_every == 0:
+            row.update(log_states(model, state_loader, test_ds, device, args, epoch,
+                                  global_step,
+                                  save=(epoch == args.epochs - 1)) or {})
+        history["epochs"].append(row)
+
+        extra = "".join(f"  {k}={va[k]:.3f}" for k in
+                        ("slot_hit_fig", "slot_hit_bg", "attn_on_fig") if k in va)
+        if "val_state_shape_iou" in row:
+            extra += (f"  shape_iou={row['val_state_shape_iou']:.3f}"
+                      f"(chance {row['val_state_shape_iou_chance']:.3f})")
+        te_desc = (f" | test loss {te_row['test_loss']:.4f} acc {te_row['test_acc']:.3f}"
+                   if "test_acc" in te_row else "")
+        print(f"epoch {epoch:3d} | train loss {tr['loss']:.4f} acc {tr['acc']:.3f} "
+              f"| val loss {va['loss']:.4f} acc {va['acc']:.3f}{extra}{te_desc} "
+              f"| {row['time']:.0f}s")
+
+        if wandb:
+            wandb.log(row, step=global_step)
+
+        if va["acc"] > best_val:
+            best_val, best_epoch, since_improved = va["acc"], epoch, 0
+            torch.save({"model": model.state_dict(), "config": vars(args),
+                        "epoch": epoch, "val_acc": best_val},
+                       models_dir / f"{run_name}_best.pth")
+        else:
+            since_improved += 1
+
+        torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                    "epoch": epoch, "best_val": best_val, "history": history,
+                    "global_step": global_step},
+                   state_dir / f"checkpoint_{run_name}.pth")
+
+        if args.early_stop_patience and since_improved >= args.early_stop_patience:
+            print(f"early stop: no val improvement for {since_improved} epochs")
+            break
+
+    ck = models_dir / f"{run_name}_best.pth"
+    if ck.exists():
+        model.load_state_dict(torch.load(ck, map_location=device)["model"])
+    recompute_bn_stats(model, train_loader, device, args.precise_bn_batches)
+    test_ds.reset_rng()
+    te = run_epoch(model, test_loader, device, args.num_figures, criterion,
+                   collect_preds=bool(wandb))
+    y_true, y_pred = te.pop("_y_true", None), te.pop("_y_pred", None)
+    history["test"] = te
+    history["best_val_acc"] = best_val
+    history["best_epoch"] = best_epoch
+
+    print(f"\nbest val acc {best_val:.3f} (epoch {best_epoch}) | "
+          f"test acc {te['acc']:.3f} loss {te['loss']:.4f}")
+    print("chance is 0.100 — read lstm's number first: if it is meaningfully "
+          "above chance the dataset is leaking, not the model working.")
+
+    if curve is not None and curve.steps:
+        history["val_curve"] = curve.as_dict()
+
+    with open(results_dir / f"history_{run_name}.json", "w") as f:
+        json.dump(history, f, indent=2)
+
+    if wandb:
+        if y_true:
+            last_step = global_step
+            wandb.log({"test_confusion": wandb.plot.confusion_matrix(
+                y_true=y_true, preds=y_pred,
+                class_names=[str(d) for d in range(10)])}, step=last_step)
+            per_class = {}
+            for t, pdt in zip(y_true, y_pred):
+                a, b = per_class.setdefault(t, [0, 0])
+                per_class[t] = [a + int(t == pdt), b + 1]
+            for d, (c, n) in sorted(per_class.items()):
+                wandb.summary[f"test_acc_digit{d}"] = c / max(n, 1)
+        wandb.summary["test_acc"] = te["acc"]
+        wandb.summary["test_loss"] = te["loss"]
+        wandb.summary["best_val_acc"] = best_val
+        wandb.summary["best_epoch"] = best_epoch
+        wandb.finish()
+
+    if not args.smoke_test:
+        done = state_dir / f"DONE_{args.model}_{run_name}.flag"
+        done.touch()
+        print(f"training complete ({args.epochs} epochs) — wrote {done}")
+
+    return history
+
+
+if __name__ == "__main__":
+    main()

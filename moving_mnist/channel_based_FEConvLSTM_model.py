@@ -1,0 +1,282 @@
+import torch
+import torch.nn as nn
+
+
+class FEConvLSTMCell(nn.Module):
+    def __init__(self,
+                 input_channels,
+                 hidden_channels,
+                 kernel_size=3,
+                 v_range=0):
+        super().__init__()
+
+        self.hidden_channels = hidden_channels
+
+        self.v_list = [
+            (vx, vy)
+            for vx in range(-v_range, v_range + 1)
+            for vy in range(-v_range, v_range + 1)
+        ]
+
+        self.num_v = len(self.v_list)
+
+        padding = kernel_size // 2
+
+        self.conv = nn.Conv2d(
+            input_channels + hidden_channels,
+            4 * hidden_channels,
+            kernel_size,
+            padding=padding,
+            padding_mode='circular',
+            bias=True
+        )
+
+        nn.init.constant_(
+            self.conv.bias[
+                hidden_channels : 2 * hidden_channels
+            ],
+            1.0
+        )
+
+        self._shift_index_cache = {}
+
+    def _get_shift_index(self, H, W, device):
+        key = (H, W, device)
+        idx = self._shift_index_cache.get(key)
+        if idx is None:
+            yy, xx = torch.meshgrid(
+                torch.arange(H, device=device),
+                torch.arange(W, device=device),
+                indexing="ij",
+            )
+            rows = []
+            for (vx, vy) in self.v_list:
+                # same as torch.roll(x, (vy, vx), dims=(2, 3))
+                src_y = (yy - vy) % H
+                src_x = (xx - vx) % W
+                rows.append((src_y * W + src_x).reshape(-1))
+            idx = torch.stack(rows, dim=0)
+            self._shift_index_cache[key] = idx
+        return idx
+
+    def shift_tensor(self, x):
+        B, num_v, C, H, W = x.shape
+
+        idx = self._get_shift_index(H, W, x.device)
+        idx = idx.view(1, num_v, 1, H * W).expand(B, num_v, C, H * W)
+
+        x_flat = x.reshape(B, num_v, C, H * W)
+        shifted = torch.gather(x_flat, dim=3, index=idx)
+        return shifted.reshape(B, num_v, C, H, W)
+
+    def forward(self, u_t, state):
+        h_prev, c_prev = state
+
+        B, _, H, W = u_t.shape
+
+        h_shift = self.shift_tensor(h_prev)
+        c_shift = self.shift_tensor(c_prev)
+
+        u_expand = (
+            u_t
+            .unsqueeze(1)
+            .expand(-1, self.num_v, -1, -1, -1)
+        )
+
+        u_flat = u_expand.reshape(
+            B * self.num_v,
+            u_t.shape[1],
+            H,
+            W
+        )
+
+        h_flat = h_shift.reshape(
+            B * self.num_v,
+            self.hidden_channels,
+            H,
+            W
+        )
+
+        combined = torch.cat([u_flat, h_flat], dim=1)
+
+        gates = self.conv(combined)
+
+        i, f, o, g = torch.chunk(gates, 4, dim=1)
+
+        i = torch.sigmoid(i)
+        f = torch.sigmoid(f)
+        o = torch.sigmoid(o)
+        g = torch.tanh(g)
+
+        c_next = f * c_shift.reshape(B * self.num_v,
+                                     self.hidden_channels,
+                                     H,
+                                     W) + i * g
+
+        h_next = o * torch.tanh(c_next)
+
+        c_next = c_next.reshape(
+            B,
+            self.num_v,
+            self.hidden_channels,
+            H,
+            W
+        )
+
+        h_next = h_next.reshape(
+            B,
+            self.num_v,
+            self.hidden_channels,
+            H,
+            W
+        )
+
+        return h_next, c_next
+
+    def init_hidden(self, batch_size, height, width, device):
+        h = torch.zeros(
+            batch_size,
+            self.num_v,
+            self.hidden_channels,
+            height,
+            width,
+            device=device
+        )
+
+        c = torch.zeros_like(h)
+
+        return h, c
+
+
+class Seq2SeqFEConvLSTM(nn.Module):
+    def __init__(self,
+                 input_channels,
+                 hidden_channels,
+                 output_channels=None,
+                 kernel_size=3,
+                 v_range=0,
+                 pool_type='max',
+                 decoder_conv_layers=1,
+                 decoder_channels=None,
+                 detach_feedback=True,
+                 decoder_act="relu"):
+        super().__init__()
+        if decoder_act not in ("relu", "leaky"):
+            raise ValueError(f"decoder_act {decoder_act!r}: expected 'relu' or 'leaky'")
+
+        self.pool_type = pool_type
+        self.detach_feedback = detach_feedback
+
+        self.output_channels = (
+            output_channels
+            if output_channels is not None
+            else input_channels
+        )
+
+        decoder_channels = (
+            decoder_channels
+            if decoder_channels is not None
+            else hidden_channels
+        )
+        self.decoder_channels = decoder_channels
+
+        self.cell = FEConvLSTMCell(
+            input_channels=input_channels,
+            hidden_channels=hidden_channels,
+            kernel_size=kernel_size,
+            v_range=v_range
+        )
+
+        self.hidden_channels = hidden_channels
+        self.num_v = self.cell.num_v
+
+        decoder = []
+        in_ch = hidden_channels
+
+        for _ in range(decoder_conv_layers):
+            decoder += [
+                nn.Conv2d(
+                    in_ch,
+                    decoder_channels,
+                    kernel_size=3,
+                    padding=1,
+                    padding_mode='circular',
+                    bias=True
+                ),
+                nn.LeakyReLU(0.01) if decoder_act == "leaky" else nn.ReLU()
+            ]
+            in_ch = decoder_channels
+
+        decoder += [
+            nn.Conv2d(
+                in_ch,
+                self.output_channels,
+                kernel_size=3,
+                padding=1,
+                padding_mode='circular',
+                bias=True
+            )
+        ]
+
+        self.decoder_conv = nn.Sequential(*decoder)
+
+    def pool_velocity(self, h):
+        if self.pool_type == 'max':
+            return h.max(dim=1)[0]
+        elif self.pool_type == 'mean':
+            return h.mean(dim=1)
+        elif self.pool_type == 'sum':
+            return h.sum(dim=1)
+        else:
+            return h.max(dim=1)[0]
+
+    def encode(self, input_seq, return_states=False):
+        B, T_in, C, H, W = input_seq.shape
+
+        h, c = self.cell.init_hidden(B, H, W, input_seq.device)
+
+        h_states = [] if return_states else None
+
+        for t in range(T_in):
+            h, c = self.cell(input_seq[:, t], (h, c))
+
+            if return_states:
+                h_states.append(h.mean(dim=2).detach())
+
+        return h, c, h_states
+
+    def forward(self,
+                input_seq,
+                pred_len,
+                return_states=False):
+        h, c, h_states = self.encode(input_seq, return_states=return_states)
+
+        prev = input_seq[:, -1]
+
+        outputs = []
+
+        for t in range(pred_len):
+            frame = prev.detach() if self.detach_feedback else prev
+
+            h, c = self.cell(
+                frame,
+                (h, c)
+            )
+
+            if return_states:
+                h_states.append(h.mean(dim=2).detach())
+
+            feat = self.pool_velocity(h)
+
+            out = self.decoder_conv(feat)
+
+            outputs.append(out)
+
+            prev = out
+
+        outputs = torch.stack(outputs, dim=1)
+
+        if return_states:
+            return outputs, {"h": torch.stack(h_states, dim=1)}
+
+        return outputs

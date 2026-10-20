@@ -1,0 +1,8 @@
+torch>=2.2
+torchvision
+numpy
+matplotlib
+h5py
+tqdm
+wandb
+opencv-python-headless
